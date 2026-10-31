@@ -108,13 +108,14 @@ def run_agent(question, conversation_history=None):
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Question cannot be empty.")
 
-    # Google Gemini models:
-    #   - gemini-2.5-flash-lite  (fastest, cheapest)
-    #   - gemini-2.5-pro        (most capable)
+    # Google Gemini models (verified available to this API key, 2026-10-31):
+    #   - gemini-3.5-flash-lite  (fast and cheap — current default)
+    #   - gemini-pro-latest      (alias that always tracks the newest Pro)
+    # Note: gemini-2.5-* models return HTTP 404 for new API keys.
     # Override via GEMINI_MODEL in Streamlit Secrets or environment.
     model = get_config(
         "GEMINI_MODEL",
-        "gemini-2.5-flash-lite"
+        "gemini-3.5-flash-lite"
     )
 
     client = build_client()
