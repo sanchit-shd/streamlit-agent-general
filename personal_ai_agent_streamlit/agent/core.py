@@ -1,19 +1,13 @@
 
-"""OpenRouter-powered personal AI agent."""
+"""Google Gemini-powered personal AI agent (native google-genai SDK)."""
 
 import os
 import logging
 from typing import Iterable
 
 import streamlit as st
-from openai import (
-    OpenAI,
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    AuthenticationError,
-    RateLimitError,
-)
+from google import genai
+from google.genai import errors, types
 
 logger = logging.getLogger(__name__)
 
@@ -50,37 +44,32 @@ def get_config(name: str, default=None):
 
 
 def build_client():
+    """Build a Google GenAI client using the configured API key."""
 
-    api_key = get_config("OPENAI_API_KEY")
+    api_key = get_config("GEMINI_API_KEY")
 
     if not api_key:
         raise AgentConfigurationError(
-            "OpenRouter API key is missing. "
-            "Configure OPENAI_API_KEY in Streamlit Secrets."
+            "Google Gemini API key is missing. "
+            "Configure GEMINI_API_KEY in Streamlit Secrets."
         )
 
-    base_url = get_config(
-        "OPENAI_BASE_URL",
-        "https://openrouter.ai/api/v1"
-    )
+    # Timeout (in seconds) applied to each HTTP request to Google's API.
+    timeout = float(get_config("GEMINI_TIMEOUT_SECONDS", "45"))
 
-    timeout = float(get_config("OPENAI_TIMEOUT_SECONDS", "45"))
-    retries = int(get_config("OPENAI_MAX_RETRIES", "2"))
-
-    return OpenAI(
+    return genai.Client(
         api_key=api_key,
-        base_url=base_url,
-        timeout=timeout,
-        max_retries=retries,
+        http_options=types.HttpOptions(timeout=timeout),
     )
 
 
 def normalize_history(history: Iterable = None):
+    """Convert chat history dicts into Gemini Content objects."""
 
-    messages = []
+    contents = []
 
     if not history:
-        return messages
+        return contents
 
     for item in history:
 
@@ -88,19 +77,27 @@ def normalize_history(history: Iterable = None):
             continue
 
         role = item.get("role")
-        content = item.get("content")
+        text = item.get("content")
+
+        # Gemini uses "model" for the AI's turns, not "assistant",
+        # so translate the role before sending it to the API.
+        if role == "assistant":
+            role = "model"
 
         if (
-            role in ("user", "assistant")
-            and isinstance(content, str)
-            and content.strip()
+            role in ("user", "model")
+            and isinstance(text, str)
+            and text.strip()
         ):
-            messages.append({
-                "role": role,
-                "content": content.strip()
-            })
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part(text=text.strip())],
+                )
+            )
 
-    return messages[-20:]
+    # Keep only the most recent turns to stay within context limits.
+    return contents[-20:]
 
 
 def run_agent(question, conversation_history=None):
@@ -108,74 +105,70 @@ def run_agent(question, conversation_history=None):
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Question cannot be empty.")
 
+    # Google Gemini models:
+    #   - gemini-2.5-flash-lite  (fastest, cheapest)
+    #   - gemini-2.5-pro        (most capable)
+    # Override via GEMINI_MODEL in Streamlit Secrets or environment.
     model = get_config(
-        "OPENAI_MODEL",
-        "openai/gpt-oss-120b"
+        "GEMINI_MODEL",
+        "gemini-2.5-flash-lite"
     )
 
     client = build_client()
 
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_INSTRUCTIONS
-        }
-    ]
-
-    messages.extend(
-        normalize_history(conversation_history)
+    # Full conversation: prior turns plus the new question.
+    contents = normalize_history(conversation_history)
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[types.Part(text=question.strip())],
+        )
     )
-
-    messages.append({
-        "role": "user",
-        "content": question.strip()
-    })
 
     try:
 
-        response = client.chat.completions.create(
+        response = client.models.generate_content(
             model=model,
-            messages=messages,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTIONS,
+            ),
         )
 
-        answer = response.choices[0].message.content
+        # response.text raises ValueError when the response contains
+        # no text parts (e.g. the reply was safety-blocked or empty).
+        try:
+            answer = response.text
+        except ValueError:
+            answer = None
 
         if not answer:
             raise AgentError("Model returned an empty response.")
 
         return answer.strip()
 
-    except AuthenticationError as exc:
-        logger.error("OpenRouter authentication failed.")
-        raise AgentError(
-            "OpenRouter authentication failed. "
-            "Verify your API key and provider configuration."
-        ) from exc
-
-    except RateLimitError as exc:
-        logger.error("OpenRouter rate limit or quota exceeded.")
-        raise AgentError(
-            "OpenRouter rate limit or credit limit reached. "
-            "Check your OpenRouter account."
-        ) from exc
-
-    except APITimeoutError as exc:
-        logger.error("OpenRouter request timed out.")
-        raise AgentError(
-            "The model request timed out. Please try again."
-        ) from exc
-
-    except APIConnectionError as exc:
-        logger.error("Could not connect to OpenRouter.")
-        raise AgentError(
-            "Could not connect to OpenRouter. Check your connection."
-        ) from exc
-
-    except APIStatusError as exc:
+    except errors.ClientError as exc:
+        # 4xx errors: invalid key, unknown model, quota exhausted, etc.
         logger.error(
-            "OpenRouter API returned HTTP %s.",
-            exc.status_code
+            "Gemini client error (HTTP %s): %s", exc.code, exc.message
         )
         raise AgentError(
-            f"OpenRouter returned an API error (HTTP {exc.status_code})."
+            f"Gemini returned a client error (HTTP {exc.code}). "
+            "Verify your API key, model name, and quota."
+        ) from exc
+
+    except errors.ServerError as exc:
+        # 5xx errors: transient issues on Google's side.
+        logger.error(
+            "Gemini server error (HTTP %s): %s", exc.code, exc.message
+        )
+        raise AgentError(
+            f"Gemini server error (HTTP {exc.code}). Please try again."
+        ) from exc
+
+    except errors.APIError as exc:
+        # Catch-all for any other Gemini API failure (incl. timeouts).
+        logger.error("Gemini API error: %s", exc)
+        raise AgentError(
+            "The Gemini request failed. Please try again."
         ) from exc
