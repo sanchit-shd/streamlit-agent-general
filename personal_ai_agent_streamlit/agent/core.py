@@ -1,111 +1,181 @@
-"""Core agent entry point.
 
-Keep orchestration, prompts, tools, and model calls out of the Streamlit UI.
-Replace or extend run_agent() with your own agent framework when ready.
-"""
-from __future__ import annotations
+"""OpenRouter-powered personal AI agent."""
 
 import os
+import logging
 from typing import Iterable
 
 import streamlit as st
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from openai import (
+    OpenAI,
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    RateLimitError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class AgentError(Exception):
-    """Raised when the agent cannot complete a request."""
+    pass
 
 
 class AgentConfigurationError(AgentError):
-    """Raised when required application configuration is missing."""
+    pass
 
 
-SYSTEM_INSTRUCTIONS = """You are a helpful personal AI assistant.
-Answer clearly and accurately. If you are unsure, say so.
-Use concise explanations and practical examples when useful."""
+SYSTEM_INSTRUCTIONS = """
+You are a helpful personal AI assistant.
+
+Your responsibilities:
+1. Answer questions accurately.
+2. Explain technical concepts clearly.
+3. Provide practical examples when useful.
+4. Structure complex answers using headings and bullet points.
+5. If you are unsure, clearly mention it.
+"""
 
 
-def _get_secret(name: str, default: str | None = None) -> str | None:
-    """Read configuration from Streamlit secrets first, then environment."""
+def get_config(name: str, default=None):
+    """Read configuration from Streamlit Secrets or environment."""
+
     try:
         value = st.secrets.get(name)
     except Exception:
         value = None
+
     return value or os.getenv(name, default)
 
 
-def _build_client() -> OpenAI:
-    api_key = _get_secret("OPENAI_API_KEY")
+def build_client():
+
+    api_key = get_config("OPENAI_API_KEY")
+
     if not api_key:
         raise AgentConfigurationError(
-            "OPENAI_API_KEY is not configured. Add it to Streamlit Cloud "
-            "App settings → Secrets, or to your local .streamlit/secrets.toml."
+            "OpenRouter API key is missing. "
+            "Configure OPENAI_API_KEY in Streamlit Secrets."
         )
 
-    try:
-        timeout_seconds = float(_get_secret("OPENAI_TIMEOUT_SECONDS", "45"))
-        max_retries = int(_get_secret("OPENAI_MAX_RETRIES", "2"))
-    except (TypeError, ValueError) as exc:
-        raise AgentConfigurationError(
-            "OPENAI_TIMEOUT_SECONDS must be numeric and "
-            "OPENAI_MAX_RETRIES must be an integer."
-        ) from exc
+    base_url = get_config(
+        "OPENAI_BASE_URL",
+        "https://openrouter.ai/api/v1"
+    )
+
+    timeout = float(get_config("OPENAI_TIMEOUT_SECONDS", "45"))
+    retries = int(get_config("OPENAI_MAX_RETRIES", "2"))
 
     return OpenAI(
         api_key=api_key,
-        timeout=timeout_seconds,
-        max_retries=max_retries,
+        base_url=base_url,
+        timeout=timeout,
+        max_retries=retries,
     )
 
 
-def _normalise_history(
-    history: Iterable[dict[str, str]] | None,
-) -> list[dict[str, str]]:
-    """Accept only user/assistant messages with non-empty string content."""
-    normalised: list[dict[str, str]] = []
+def normalize_history(history: Iterable = None):
+
+    messages = []
+
     if not history:
-        return normalised
+        return messages
 
     for item in history:
+
         if not isinstance(item, dict):
             continue
+
         role = item.get("role")
         content = item.get("content")
-        if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
-            normalised.append({"role": role, "content": content.strip()})
-    return normalised[-20:]
+
+        if (
+            role in ("user", "assistant")
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            messages.append({
+                "role": role,
+                "content": content.strip()
+            })
+
+    return messages[-20:]
 
 
-def run_agent(
-    question: str,
-    conversation_history: Iterable[dict[str, str]] | None = None,
-) -> str:
-    """Run the assistant and return a plain-text answer.
+def run_agent(question, conversation_history=None):
 
-    `conversation_history` should contain only prior user/assistant turns.
-    """
     if not isinstance(question, str) or not question.strip():
-        raise ValueError("question must be a non-empty string")
+        raise ValueError("Question cannot be empty.")
 
-    model = _get_secret("OPENAI_MODEL", "gpt-4.1-mini")
-    client = _build_client()
+    model = get_config(
+        "OPENAI_MODEL",
+        "openai/gpt-oss-120b"
+    )
 
-    input_messages = _normalise_history(conversation_history)
-    input_messages.append({"role": "user", "content": question.strip()})
+    client = build_client()
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_INSTRUCTIONS
+        }
+    ]
+
+    messages.extend(
+        normalize_history(conversation_history)
+    )
+
+    messages.append({
+        "role": "user",
+        "content": question.strip()
+    })
 
     try:
-        response = client.responses.create(
-            model=model,
-            instructions=SYSTEM_INSTRUCTIONS,
-            input=input_messages,
-        )
-        answer = (response.output_text or "").strip()
-        if not answer:
-            raise AgentError("The model returned an empty response.")
-        return answer
 
-    except (APIConnectionError, APITimeoutError) as exc:
-        raise AgentError("Could not connect to the model provider.") from exc
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+        )
+
+        answer = response.choices[0].message.content
+
+        if not answer:
+            raise AgentError("Model returned an empty response.")
+
+        return answer.strip()
+
+    except AuthenticationError as exc:
+        logger.error("OpenRouter authentication failed.")
+        raise AgentError(
+            "OpenRouter authentication failed. "
+            "Verify your API key and provider configuration."
+        ) from exc
+
+    except RateLimitError as exc:
+        logger.error("OpenRouter rate limit or quota exceeded.")
+        raise AgentError(
+            "OpenRouter rate limit or credit limit reached. "
+            "Check your OpenRouter account."
+        ) from exc
+
+    except APITimeoutError as exc:
+        logger.error("OpenRouter request timed out.")
+        raise AgentError(
+            "The model request timed out. Please try again."
+        ) from exc
+
+    except APIConnectionError as exc:
+        logger.error("Could not connect to OpenRouter.")
+        raise AgentError(
+            "Could not connect to OpenRouter. Check your connection."
+        ) from exc
+
     except APIStatusError as exc:
-        # Keep provider details in logs, not in the UI.
-        raise AgentError("The model provider rejected the request.") from exc
+        logger.error(
+            "OpenRouter API returned HTTP %s.",
+            exc.status_code
+        )
+        raise AgentError(
+            f"OpenRouter returned an API error (HTTP {exc.status_code})."
+        ) from exc
