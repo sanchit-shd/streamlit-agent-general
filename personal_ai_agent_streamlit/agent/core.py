@@ -5,6 +5,7 @@ import os
 import logging
 from typing import Iterable
 
+import httpx
 import streamlit as st
 from google import genai
 from google.genai import errors, types
@@ -54,12 +55,14 @@ def build_client():
             "Configure GEMINI_API_KEY in Streamlit Secrets."
         )
 
-    # Timeout (in seconds) applied to each HTTP request to Google's API.
-    timeout = float(get_config("GEMINI_TIMEOUT_SECONDS", "45"))
+    # Timeout in seconds for each HTTP request to Google's API.
+    # HttpOptions.timeout expects MILLISECONDS, so convert explicitly.
+    # 120s default: Gemini "thinking" models can take a while to reply.
+    timeout = float(get_config("GEMINI_TIMEOUT_SECONDS", "120"))
 
     return genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=timeout),
+        http_options=types.HttpOptions(timeout=int(timeout * 1000)),
     )
 
 
@@ -146,6 +149,24 @@ def run_agent(question, conversation_history=None):
             raise AgentError("Model returned an empty response.")
 
         return answer.strip()
+
+    except httpx.TimeoutException as exc:
+        # httpx.ReadTimeout and friends are raised directly by the HTTP
+        # transport layer — google.genai does NOT wrap them in APIError,
+        # so catch them explicitly to avoid an unhandled app crash.
+        logger.error("Gemini request timed out: %s", exc)
+        raise AgentError(
+            "The Gemini request timed out. Please try again, or raise "
+            "GEMINI_TIMEOUT_SECONDS in Streamlit Secrets."
+        ) from exc
+
+    except httpx.TransportError as exc:
+        # Other transport failures (connection reset, DNS, TLS, etc.).
+        logger.error("Gemini connection error: %s", exc)
+        raise AgentError(
+            "Could not reach the Gemini API. Check your connection "
+            "and try again."
+        ) from exc
 
     except errors.ClientError as exc:
         # 4xx errors: invalid key, unknown model, quota exhausted, etc.
